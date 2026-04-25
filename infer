@@ -389,13 +389,23 @@ class InferHandler(http.server.BaseHTTPRequestHandler):
     def _models(self) -> None:
         catalog = load_catalog()
         grouped = grouped_keys()
+        # Filter by probe cache: aliases marked ok=False are excluded.
+        # Unprobed aliases pass through (probe may not have run yet).
+        # If no probe cache exists at all, expose everything — otherwise
+        # a fresh install would show an empty model list.
+        probe = load_probe_cache(ignore_ttl=True)
         models = []
         for p in catalog:
             if not (grouped.get(p["key_env"]) or p.get("optional_key")):
                 continue
             for m in p.get("model", []):
+                alias = m["alias"]
+                if probe is not None:
+                    r = probe.get(alias)
+                    if r is not None and not r.get("ok"):
+                        continue
                 models.append({
-                    "id": m["alias"],
+                    "id": alias,
                     "object": "model",
                     "owned_by": p["name"],
                 })
