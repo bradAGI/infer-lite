@@ -2,7 +2,7 @@
   <img src="banner.png" alt="infer-lite — minimum viable free-LLM gateway" width="100%">
 </p>
 
-<h1 align="center">fi-gateway-lite</h1>
+<h1 align="center">infer-lite</h1>
 
 <p align="center">
   <strong>Minimum viable architecture: stdlib-only LLM gateway.</strong><br>
@@ -22,8 +22,8 @@
 
 ```bash
 # 1. Install
-git clone https://github.com/bradAGI/fi-gateway-lite && cd fi-gateway-lite
-# or:  npx skills add bradagi/fi-gateway-lite
+git clone https://github.com/bradAGI/infer-lite && cd infer-lite
+# or:  npx skills add bradagi/infer-lite
 
 # 2. Add free keys
 ./infer keys add gemini AIza...
