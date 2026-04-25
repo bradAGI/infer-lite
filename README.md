@@ -38,7 +38,15 @@ git clone https://github.com/bradAGI/infer-lite && cd infer-lite
 
 # 5. Wire your coding agents (any combination)
 ./infer wire cc | opencode | pi | openclaw | hermes
+
+# 6. (optional) Make the command run from anywhere
+./infer install            # symlinks ~/.local/bin/infer → this script
+infer doctor               # works from any directory
 ```
+
+`./infer install` detects your shell (bash / zsh / fish on macOS and Linux) and prints the right `~/.zshrc` / `~/.bashrc` / `~/.config/fish/config.fish` line if `~/.local/bin` isn't on `$PATH`. `./infer uninstall` removes the symlink. Pass `--name <other>` to install under a different command name.
+
+> **Permission denied?** If `./infer` errors with "Permission denied" right after clone or skill install, the executable bit didn't survive the transfer. Run `chmod +x infer` once and you're set.
 
 ## Use it
 
