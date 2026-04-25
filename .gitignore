@@ -1,0 +1,19 @@
+# User data (should never be in the repo)
+**/.config/infer/
+keys.env
+.discovery-cache.json
+.probe-cache.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Local noise
+*.log
+.DS_Store
+*.fi-backup
+*.infer-backup

@@ -1,0 +1,1123 @@
+#!/usr/bin/env python3
+"""infer (lite) — stdlib-only LLM gateway. No Docker, no LiteLLM.
+
+Single Python file (Python 3.11+). Listens on localhost:4000 and forwards
+OpenAI-shape requests to provider /v1/chat/completions and /v1/embeddings
+endpoints with the user's free keys. Streams SSE through. No master key,
+no config.yaml regeneration.
+
+Usage:
+    ./infer keys add <provider> <key>
+    ./infer serve              # blocks; Ctrl-C to stop
+    ./infer probe              # smoke-test every alias against upstreams
+    ./infer wire cc | opencode | pi | openclaw | hermes
+"""
+from __future__ import annotations
+
+import argparse
+import http.server
+import json
+import os
+import re
+import socket
+import socketserver
+import subprocess
+import sys
+import time
+import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+GATEWAY_DIR = Path(__file__).resolve().parent
+HOME = Path(os.environ.get("INFER_HOME") or Path.home() / ".config" / "infer").expanduser()
+KEYS_ENV = HOME / "keys.env"
+DISCOVERY_CACHE = HOME / ".discovery-cache.json"
+DISCOVERY_TTL = 24 * 3600
+PROBE_CACHE = HOME / ".probe-cache.json"
+PROBE_TTL = 24 * 3600
+PROVIDERS_TOML = GATEWAY_DIR / "providers.toml"
+PORT = int(os.environ.get("INFER_PORT", "4000"))
+HOST = os.environ.get("INFER_HOST", "localhost")
+BIND_HOST = os.environ.get("INFER_BIND_HOST", "127.0.0.1")
+BASE_URL = f"http://{HOST}:{PORT}"
+
+
+# --- pretty output --------------------------------------------------------
+
+class C:
+    R = "\033[0m"; G = "\033[32m"; Y = "\033[33m"
+    RD = "\033[31m"; D = "\033[2m"; B = "\033[1m"
+
+def out(msg: str = "") -> None: print(msg)
+def err(msg: str) -> None: print(f"{C.RD}{msg}{C.R}", file=sys.stderr)
+def ok(msg: str) -> None: print(f"{C.G}✓{C.R} {msg}")
+def info(label: str, value: str) -> None: print(f"{C.B}{label}:{C.R} {value}")
+
+
+# --- keystore -------------------------------------------------------------
+
+_LINE = re.compile(r"^([A-Z][A-Z0-9_]*)=(.*)$")
+
+def load_keys() -> dict[str, str]:
+    if not KEYS_ENV.exists():
+        return {}
+    result: dict[str, str] = {}
+    for raw in KEYS_ENV.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _LINE.match(line)
+        if m:
+            result[m.group(1)] = m.group(2)
+    return result
+
+def save_keys(values: dict[str, str]) -> None:
+    HOME.mkdir(parents=True, exist_ok=True)
+    try:
+        HOME.chmod(0o700)
+    except OSError:
+        pass
+    fd = os.open(KEYS_ENV, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("".join(f"{k}={v}\n" for k, v in values.items()))
+    KEYS_ENV.chmod(0o600)
+
+def grouped_keys() -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {}
+    for name in load_keys():
+        base = re.sub(r"_\d+$", "", name)
+        result.setdefault(base, []).append(name)
+    return result
+
+def add_key(key_env: str, value: str) -> str:
+    values = load_keys()
+    idx = 1
+    while f"{key_env}_{idx}" in values:
+        idx += 1
+    name = f"{key_env}_{idx}"
+    values[name] = value
+    save_keys(values)
+    return name
+
+def remove_key(key_env: str, index: int | None = None) -> list[str]:
+    values = load_keys()
+    removed: list[str] = []
+    if index is not None:
+        name = f"{key_env}_{index}"
+        if name in values:
+            del values[name]
+            removed.append(name)
+    else:
+        for name in list(values):
+            if name == key_env or name.startswith(f"{key_env}_"):
+                del values[name]
+                removed.append(name)
+    if removed:
+        save_keys(values)
+    return removed
+
+def mask(value: str) -> str:
+    return "•" * len(value) if len(value) <= 8 else f"{value[:4]}…{value[-4:]}"
+
+def pick_key(prov: dict) -> str | None:
+    keys = grouped_keys().get(prov["key_env"], [])
+    if not keys:
+        return None
+    values = load_keys()
+    slot = keys[time.time_ns() % len(keys)]
+    return values[slot]
+
+
+# --- catalog --------------------------------------------------------------
+
+def load_catalog(refresh_discovery: bool = False) -> list[dict]:
+    with PROVIDERS_TOML.open("rb") as f:
+        catalog = tomllib.load(f).get("provider", [])
+    grouped = grouped_keys()
+    for prov in catalog:
+        kind = prov.get("discovery")
+        if not kind:
+            continue
+        if not (grouped.get(prov["key_env"]) or prov.get("optional_key")):
+            continue
+        discovered = _run_discovery(kind, refresh=refresh_discovery)
+        existing = {m["alias"] for m in prov.get("model", [])}
+        prov.setdefault("model", [])
+        for m in discovered:
+            if m["alias"] not in existing:
+                prov["model"].append(m)
+    return catalog
+
+def find_provider(name: str) -> dict:
+    for p in load_catalog():
+        if p["name"] == name:
+            return p
+    err(f"unknown provider: {name}")
+    sys.exit(1)
+
+def find_model(alias: str) -> tuple[dict | None, dict | None]:
+    for p in load_catalog():
+        for m in p.get("model", []):
+            if m["alias"] == alias:
+                return p, m
+    return None, None
+
+
+# --- discovery ------------------------------------------------------------
+
+_DROP_NAME_FRAGMENTS = (
+    "/imagen", "imagen-", "/dalle", "dall-e", "stable-diffusion", "/flux",
+    "/seedream", "/seedance", "nano-banana",
+    "/veo", "veo-", "lyria", "synthetic-video-detector",
+    "whisper", "/tts", "-tts-", "speech-to-text", "text-to-speech",
+    "voxtral", "audio-model",
+    "nemoretriever", "/nemotron-parse", "-parse-",
+    "/vila",
+)
+_EMBED_NAME_FRAGMENTS = (
+    "/embed-", "-embed-v", "embedding-", "/embeddings/", "/embedding-",
+    "embed-multilingual", "bge-",
+    "embedqa", "embedcode", "nv-embed", "-embedqa", "-embedcode",
+    "-embedding", "/embedding",
+)
+_RERANK_NAME_FRAGMENTS = ("rerank-", "-rerank", "/rerank/")
+
+def _classify_alias(name: str) -> str:
+    n = name.lower()
+    if any(f in n for f in _DROP_NAME_FRAGMENTS): return "drop"
+    if any(f in n for f in _EMBED_NAME_FRAGMENTS): return "embed"
+    if any(f in n for f in _RERANK_NAME_FRAGMENTS): return "rerank"
+    return "chat"
+
+def _load_disc_cache(key: str, ignore_ttl: bool = False) -> list[dict] | None:
+    if not DISCOVERY_CACHE.exists(): return None
+    try: cache = json.loads(DISCOVERY_CACHE.read_text())
+    except Exception: return None
+    entry = cache.get(key)
+    if not entry: return None
+    if not ignore_ttl and time.time() - entry["t"] > DISCOVERY_TTL: return None
+    return entry["models"]
+
+def _save_disc_cache(key: str, models: list[dict]) -> None:
+    HOME.mkdir(parents=True, exist_ok=True)
+    cache: dict = {}
+    if DISCOVERY_CACHE.exists():
+        try: cache = json.loads(DISCOVERY_CACHE.read_text())
+        except Exception: cache = {}
+    cache[key] = {"t": time.time(), "models": models}
+    DISCOVERY_CACHE.write_text(json.dumps(cache))
+
+def _run_discovery(kind: str, refresh: bool = False) -> list[dict]:
+    handlers = {
+        "openrouter_free": _fetch_openrouter,
+        "nvidia_nim": _fetch_nvidia,
+        "gemini": _fetch_gemini,
+    }
+    h = handlers.get(kind)
+    if not h:
+        err(f"unknown discovery kind: {kind}")
+        return []
+    return h(refresh=refresh)
+
+def _is_free(pricing: dict) -> bool:
+    def zero(v):
+        try: return float(v) == 0.0
+        except (TypeError, ValueError): return False
+    return zero(pricing.get("prompt")) and zero(pricing.get("completion"))
+
+
+def _fetch_openrouter(refresh: bool = False) -> list[dict]:
+    if not refresh:
+        c = _load_disc_cache("openrouter_free")
+        if c is not None: return c
+    print(f"{C.D}discovering openrouter free models…{C.R}", file=sys.stderr)
+    try:
+        with urllib.request.urlopen("https://openrouter.ai/api/v1/models", timeout=20) as r:
+            data = json.loads(r.read())
+    except Exception as e:
+        err(f"openrouter discovery failed: {e}")
+        return _load_disc_cache("openrouter_free", ignore_ttl=True) or []
+    out_list = []
+    for m in data.get("data", []):
+        pricing = m.get("pricing") or {}
+        if not _is_free(pricing): continue
+        mid = m.get("id") or ""
+        if not mid: continue
+        cls = _classify_alias(mid)
+        if cls == "drop": continue
+        arch = m.get("architecture") or {}
+        out_modalities = arch.get("output_modalities")
+        if cls == "chat" and isinstance(out_modalities, list) and out_modalities and "text" not in out_modalities:
+            continue
+        groups = ["free", "openrouter"]
+        if cls == "embed": groups.append("embed")
+        if cls == "rerank": groups.append("rerank")
+        out_list.append({"alias": mid, "upstream": mid, "groups": groups})
+    _save_disc_cache("openrouter_free", out_list)
+    return out_list
+
+
+def _fetch_nvidia(refresh: bool = False) -> list[dict]:
+    if not refresh:
+        c = _load_disc_cache("nvidia_nim")
+        if c is not None: return c
+    keys_for = grouped_keys().get("NVIDIA_API_KEY", [])
+    if not keys_for: return []
+    token = load_keys()[keys_for[0]]
+    print(f"{C.D}discovering nvidia nim models…{C.R}", file=sys.stderr)
+    try:
+        req = urllib.request.Request(
+            "https://integrate.api.nvidia.com/v1/models",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read())
+    except Exception as e:
+        err(f"nvidia discovery failed: {e}")
+        return _load_disc_cache("nvidia_nim", ignore_ttl=True) or []
+    out_list = []
+    for m in data.get("data", []):
+        mid = m.get("id", "")
+        if not mid: continue
+        cls = _classify_alias(mid)
+        if cls == "drop": continue
+        groups = ["nvidia", "free"]
+        if cls == "embed": groups.append("embed")
+        if cls == "rerank": groups.append("rerank")
+        out_list.append({"alias": mid, "upstream": mid, "groups": groups})
+    _save_disc_cache("nvidia_nim", out_list)
+    return out_list
+
+
+_GEMINI_DROP = (
+    "-image", "-tts", "-audio", "-live-", "-video", "-robotics",
+    "imagen", "veo", "lyria", "nano-banana", "computer-use",
+    "aqa", "deep-research",
+)
+
+def _fetch_gemini(refresh: bool = False) -> list[dict]:
+    if not refresh:
+        c = _load_disc_cache("gemini")
+        if c is not None: return c
+    keys_for = grouped_keys().get("GEMINI_API_KEY", [])
+    if not keys_for: return []
+    token = load_keys()[keys_for[0]]
+    print(f"{C.D}discovering gemini / ai-studio models…{C.R}", file=sys.stderr)
+    try:
+        req = urllib.request.Request(
+            "https://generativelanguage.googleapis.com/v1beta/openai/models",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read())
+    except Exception as e:
+        err(f"gemini discovery failed: {e}")
+        return _load_disc_cache("gemini", ignore_ttl=True) or []
+    out_list = []
+    for m in data.get("data", []):
+        raw = m.get("id") or ""
+        mid = raw.split("/", 1)[-1] if raw.startswith("models/") else raw
+        if not mid: continue
+        lower = mid.lower()
+        if any(p in lower for p in _GEMINI_DROP): continue
+        cls = _classify_alias(mid)
+        if cls == "drop": continue
+        groups = ["gemini", "free"]
+        if cls == "embed": groups.append("embed")
+        if cls == "rerank": groups.append("rerank")
+        out_list.append({"alias": mid, "upstream": mid, "groups": groups})
+    _save_disc_cache("gemini", out_list)
+    return out_list
+
+
+# --- probe cache ----------------------------------------------------------
+
+def load_probe_cache(ignore_ttl: bool = False) -> dict | None:
+    if not PROBE_CACHE.exists(): return None
+    try: data = json.loads(PROBE_CACHE.read_text())
+    except Exception: return None
+    if not ignore_ttl and time.time() - data.get("t", 0) > PROBE_TTL: return None
+    return data.get("results", {})
+
+def save_probe_cache(results: dict) -> None:
+    HOME.mkdir(parents=True, exist_ok=True)
+    PROBE_CACHE.write_text(json.dumps({"t": time.time(), "results": results}))
+
+
+# --- gateway server -------------------------------------------------------
+
+class InferHandler(http.server.BaseHTTPRequestHandler):
+    """Forwards OpenAI-shape requests to upstream provider endpoints."""
+
+    server_version = "infer-lite/0.1"
+
+    def log_message(self, format, *args):  # noqa: A002
+        # Quieter default; print to stderr without timestamp clutter.
+        sys.stderr.write(f"{self.address_string()} {format % args}\n")
+
+    def _json_error(self, code: int, message: str) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        body = json.dumps({"error": {"message": message, "code": code}}).encode()
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):  # noqa: N802
+        if self.path in ("/health", "/v1/health", "/health/liveliness"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK\n")
+            return
+        if self.path == "/v1/models":
+            self._models()
+            return
+        self._json_error(404, f"unknown path: {self.path}")
+
+    def do_POST(self):  # noqa: N802
+        if self.path == "/v1/chat/completions":
+            self._forward("/chat/completions")
+        elif self.path == "/v1/embeddings":
+            self._forward("/embeddings")
+        else:
+            self._json_error(404, f"unknown path: {self.path}")
+
+    def _models(self) -> None:
+        catalog = load_catalog()
+        grouped = grouped_keys()
+        models = []
+        for p in catalog:
+            if not (grouped.get(p["key_env"]) or p.get("optional_key")):
+                continue
+            for m in p.get("model", []):
+                models.append({
+                    "id": m["alias"],
+                    "object": "model",
+                    "owned_by": p["name"],
+                })
+        body = json.dumps({"object": "list", "data": models}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _forward(self, upstream_path: str) -> None:
+        n = int(self.headers.get("Content-Length", "0") or "0")
+        raw = self.rfile.read(n)
+        try:
+            req_body = json.loads(raw)
+        except json.JSONDecodeError:
+            self._json_error(400, "request body is not valid JSON")
+            return
+        alias = req_body.get("model")
+        if not alias:
+            self._json_error(400, "missing 'model' in request body")
+            return
+        prov, model = find_model(alias)
+        if not prov or not model:
+            self._json_error(404, f"unknown model: {alias}")
+            return
+        # rewrite to upstream id
+        req_body["model"] = model["upstream"]
+        key = pick_key(prov)
+        if key is None and not prov.get("optional_key"):
+            self._json_error(401, f"no key configured for provider '{prov['name']}'")
+            return
+
+        url = prov["base_url"].rstrip("/") + upstream_path
+        out_data = json.dumps(req_body).encode()
+        out_headers = {"Content-Type": "application/json"}
+        if key:
+            out_headers["Authorization"] = f"Bearer {key}"
+        # propagate Anthropic-version header if present (some upstreams care)
+        if "anthropic-version" in {k.lower() for k in self.headers.keys()}:
+            for k, v in self.headers.items():
+                if k.lower() == "anthropic-version":
+                    out_headers["anthropic-version"] = v
+                    break
+
+        upstream_req = urllib.request.Request(url, data=out_data, headers=out_headers)
+        try:
+            with urllib.request.urlopen(upstream_req, timeout=300) as r:
+                self._stream_response(r)
+        except urllib.error.HTTPError as e:
+            # forward upstream error body verbatim
+            body = e.read()
+            self.send_response(e.code)
+            ct = e.headers.get("Content-Type", "application/json")
+            self.send_header("Content-Type", ct)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except urllib.error.URLError as e:
+            self._json_error(502, f"upstream unreachable: {e.reason}")
+        except socket.timeout:
+            self._json_error(504, "upstream timed out")
+        except Exception as e:
+            self._json_error(500, f"{type(e).__name__}: {e}")
+
+    def _stream_response(self, upstream) -> None:
+        """Pump bytes from upstream to client, flushing on every chunk so
+        SSE streaming works."""
+        self.send_response(upstream.status)
+        ct = upstream.headers.get("Content-Type", "application/json")
+        self.send_header("Content-Type", ct)
+        # No content-length — content may be chunked SSE.
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        try:
+            while True:
+                chunk = upstream.read(4096)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return  # client went away mid-stream — fine
+
+
+class _ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def cmd_serve(args) -> int:
+    if not PROVIDERS_TOML.exists():
+        err(f"no providers.toml at {PROVIDERS_TOML}")
+        return 1
+    bind = args.bind or BIND_HOST
+    server = _ThreadedServer((bind, args.port or PORT), InferHandler)
+    info("Listening", f"http://{bind}:{server.server_address[1]}")
+    info("Catalog", str(PROVIDERS_TOML))
+    info("Keys", str(KEYS_ENV))
+    out("Press Ctrl-C to stop.")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        out("\nshutting down")
+    finally:
+        server.server_close()
+    return 0
+
+
+# --- probe (direct upstream) ----------------------------------------------
+
+def _probe_one(prov: dict, model: dict, kind: str, timeout: int) -> tuple[str, dict]:
+    alias = model["alias"]
+    key = pick_key(prov)
+    if key is None and not prov.get("optional_key"):
+        return alias, {"ok": False, "note": "no key for provider"}
+    if kind == "embed":
+        path = "/embeddings"
+        body = {"model": model["upstream"], "input": "test"}
+    else:
+        path = "/chat/completions"
+        body = {
+            "model": model["upstream"],
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 256,
+        }
+    url = prov["base_url"].rstrip("/") + path
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
+    start = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read())
+        latency_ms = int((time.monotonic() - start) * 1000)
+        if kind == "embed":
+            records = data.get("data") or []
+            vec = records[0].get("embedding") if records else None
+            ok_flag = bool(vec) and isinstance(vec, list) and len(vec) > 0
+            return alias, {"ok": ok_flag, "latency_ms": latency_ms, "endpoint": "embed",
+                           "note": None if ok_flag else "no embedding vector"}
+        msg = (data.get("choices") or [{}])[0].get("message") or {}
+        has_content = bool(msg.get("content")) or bool(msg.get("reasoning_content"))
+        usage = data.get("usage") or {}
+        return alias, {
+            "ok": has_content,
+            "latency_ms": latency_ms,
+            "completion_tokens": usage.get("completion_tokens", 0),
+            "note": None if has_content else "empty response (try higher max_tokens)",
+        }
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode("utf-8", errors="replace")[:140]
+        if e.code == 429: note = f"429 rate-limited: {body_text[:80]}"
+        elif e.code in (401, 403): note = f"{e.code} auth: {body_text[:80]}"
+        elif e.code == 404: note = f"404 not found: {body_text[:80]}"
+        elif 500 <= e.code < 600: note = f"{e.code} upstream error: {body_text[:60]}"
+        else: note = f"{e.code}: {body_text[:80]}"
+        return alias, {"ok": False, "code": e.code, "note": note}
+    except Exception as e:
+        return alias, {"ok": False, "note": f"{type(e).__name__}: {str(e)[:90]}"}
+
+
+def cmd_probe(args) -> int:
+    catalog = load_catalog()
+    grouped = grouped_keys()
+    targets: list[tuple[dict, dict, str]] = []
+    seen: set[str] = set()
+    for p in catalog:
+        if not (grouped.get(p["key_env"]) or p.get("optional_key")):
+            continue
+        for m in p.get("model", []):
+            if args.group and args.group not in m.get("groups", []):
+                continue
+            if args.provider and args.provider != p["name"]:
+                continue
+            alias = m["alias"]
+            if alias in seen: continue
+            mgroups = set(m.get("groups", []))
+            if "rerank" in mgroups: continue  # no standard probe shape
+            kind = "embed" if "embed" in mgroups else "chat"
+            seen.add(alias)
+            targets.append((p, m, kind))
+    if args.limit: targets = targets[:args.limit]
+    if not targets:
+        err("no aliases to probe (try --group, --provider, or add keys)")
+        return 1
+    n_chat = sum(1 for _, _, k in targets if k == "chat")
+    n_embed = sum(1 for _, _, k in targets if k == "embed")
+    out(f"Probing {len(targets)} aliases ({n_chat} chat, {n_embed} embed; concurrency={args.concurrency}, timeout={args.timeout}s)…")
+    results: dict[str, dict] = {}
+    existing = load_probe_cache(ignore_ttl=True) or {}
+    results.update(existing)
+    okc = failc = 0
+    done = 0
+    with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+        futs = {pool.submit(_probe_one, p, m, k, args.timeout): m["alias"] for (p, m, k) in targets}
+        for fut in as_completed(futs):
+            alias, r = fut.result()
+            results[alias] = r
+            done += 1
+            if r.get("ok"):
+                okc += 1
+                mark = f"{C.G}✓{C.R}"
+                detail = f"{r.get('latency_ms', '?')}ms"
+            else:
+                failc += 1
+                mark = f"{C.RD}✗{C.R}"
+                detail = r.get("note", "")
+            print(f"  [{done:>3}/{len(targets)}] {mark} {alias:<48} {detail}", file=sys.stderr)
+    save_probe_cache(results)
+    out("")
+    ok(f"{okc} working, {C.RD}{failc} broken{C.R} — cached at {PROBE_CACHE}")
+    return 0
+
+
+# --- commands -------------------------------------------------------------
+
+def cmd_keys_add(args) -> int:
+    p = find_provider(args.provider)
+    name = add_key(p["key_env"], args.key)
+    ok(f"stored as {name}")
+    return 0
+
+def cmd_keys_list(args) -> int:
+    grouped = grouped_keys()
+    if not grouped:
+        out("No keys configured. Use `./infer keys add <provider> <key>`.")
+        return 0
+    raw = load_keys()
+    print(f"{'Provider':<18} {'Variable':<28} Value")
+    print("-" * 64)
+    for base in sorted(grouped):
+        for var in grouped[base]:
+            print(f"{base:<18} {var:<28} {mask(raw.get(var, ''))}")
+    return 0
+
+def cmd_keys_remove(args) -> int:
+    p = find_provider(args.provider)
+    removed = remove_key(p["key_env"], index=args.index)
+    if not removed:
+        err("nothing removed"); return 1
+    ok(f"removed: {', '.join(removed)}")
+    return 0
+
+def cmd_providers(args) -> int:
+    catalog = load_catalog()
+    grouped = grouped_keys()
+    print(f"{'Provider':<16} {'Status':<18} {'Keys':<5} Models")
+    print("-" * 50)
+    for p in catalog:
+        keys = grouped.get(p["key_env"], [])
+        status = (f"{C.G}active{C.R}" if keys
+                  else f"{C.Y}keyless{C.R}" if p.get("optional_key")
+                  else f"{C.D}inactive{C.R}")
+        print(f"{p['name']:<16} {status:<28} {len(keys):<5} {len(p.get('model', []))}")
+    return 0
+
+def cmd_models(args) -> int:
+    catalog = load_catalog()
+    grouped = grouped_keys()
+    probe = load_probe_cache() if (args.working or args.broken) else None
+    if (args.working or args.broken) and probe is None:
+        err("no probe cache (or stale) — run `./infer probe` first"); return 1
+    rows = []
+    for p in catalog:
+        if not (grouped.get(p["key_env"]) or p.get("optional_key")):
+            continue
+        for m in p.get("model", []):
+            if args.group and args.group not in m.get("groups", []):
+                continue
+            if probe is not None:
+                r = probe.get(m["alias"])
+                if args.working and not (r and r.get("ok")): continue
+                if args.broken and (r is None or r.get("ok")): continue
+            rows.append((m["alias"], p["name"], ",".join(m.get("groups", []))))
+    width = max((len(a) for a, _, _ in rows), default=35)
+    print(f"{'Alias':<{width}}  {'Provider':<14} Groups")
+    print("-" * (width + 30))
+    for a, prov, g in rows:
+        print(f"{a:<{width}}  {prov:<14} {g}")
+    print(f"\n{len(rows)} models")
+    return 0
+
+def cmd_sync(args) -> int:
+    grouped = grouped_keys()
+    catalog = load_catalog(refresh_discovery=True)
+    any_dynamic = False
+    for prov in catalog:
+        if not prov.get("discovery"): continue
+        any_dynamic = True
+        has_key = bool(grouped.get(prov["key_env"]) or prov.get("optional_key"))
+        if not has_key:
+            print(f"{C.D}∅ {prov['name']}: skipped (no key){C.R}")
+            continue
+        ok(f"{prov['name']}: {len(prov.get('model', []))} models cached")
+    if not any_dynamic:
+        out("No discoverable providers configured.")
+    # prune stale probe entries
+    all_aliases = {m["alias"] for p in catalog for m in p.get("model", [])}
+    probe = load_probe_cache(ignore_ttl=True) or {}
+    stale = [a for a in probe if a not in all_aliases]
+    if stale:
+        for a in stale: probe.pop(a, None)
+        save_probe_cache(probe)
+        out(f"{C.D}pruned {len(stale)} stale probe entries{C.R}")
+    return 0
+
+
+# --- doctor ---------------------------------------------------------------
+
+def _is_serving(timeout: float = 1.0) -> bool:
+    try:
+        with urllib.request.urlopen(f"{BASE_URL}/health", timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+def _fmt_age(ts: float) -> str:
+    delta = max(0, int(time.time() - ts))
+    if delta < 60: return f"{delta}s ago"
+    if delta < 3600: return f"{delta // 60}m ago"
+    if delta < 86400: return f"{delta // 3600}h ago"
+    return f"{delta // 86400}d ago"
+
+def cmd_doctor(args) -> int:
+    alive = _is_serving()
+    print(f"{C.B}GATEWAY{C.R}")
+    print(f"  server: {C.G}up at {BASE_URL}{C.R}" if alive else f"  server: {C.RD}down{C.R} — run `./infer serve` (or background with nohup)")
+    catalog = load_catalog()
+    grouped = grouped_keys()
+    active = [p for p in catalog if grouped.get(p["key_env"]) or p.get("optional_key")]
+    print(f"\n{C.B}PROVIDERS{C.R}  ({C.G}{len(active)} active{C.R}, {C.D}{len(catalog) - len(active)} inactive{C.R})")
+    for p in active:
+        keys = grouped.get(p["key_env"], [])
+        label = f"{len(keys)} keys" if keys else f"{C.Y}keyless{C.R}"
+        print(f"  {C.G}✓{C.R} {p['name']:<14} {label:<22} {len(p.get('model', []))} models")
+
+    print(f"\n{C.B}DISCOVERY CACHE{C.R}")
+    if DISCOVERY_CACHE.exists():
+        try: disc = json.loads(DISCOVERY_CACHE.read_text())
+        except Exception: disc = {}
+        for k, e in disc.items():
+            n = len(e.get("models", []))
+            age = _fmt_age(e.get("t", 0))
+            stale = (time.time() - e.get("t", 0)) > DISCOVERY_TTL
+            mark = f"{C.Y}STALE{C.R}" if stale else f"{C.G}fresh{C.R}"
+            print(f"  {k:<24} {n:>4} models · {age:<14} {mark}")
+    else:
+        print("  (no discovery cache yet — run `./infer sync`)")
+
+    print(f"\n{C.B}PROBE CACHE{C.R}")
+    if PROBE_CACHE.exists():
+        try: pr = json.loads(PROBE_CACHE.read_text())
+        except Exception: pr = {}
+        results = pr.get("results", {})
+        ok_count = sum(1 for v in results.values() if v.get("ok"))
+        age = _fmt_age(pr.get("t", 0))
+        stale = (time.time() - pr.get("t", 0)) > PROBE_TTL
+        mark = f"{C.Y}STALE{C.R}" if stale else f"{C.G}fresh{C.R}"
+        print(f"  {C.G}{ok_count} working{C.R} · {C.RD}{len(results) - ok_count} broken{C.R} · {len(results)} total · {age} · {mark}")
+    else:
+        print("  (no probe cache yet — run `./infer probe`)")
+
+    print(f"\n{C.B}WIRED CLIENTS{C.R}")
+    targets = _wire_targets()
+    for name, t in targets.items():
+        installed = _tool_installed(t["binary"])
+        if not installed:
+            print(f"  {C.D}∅{C.R} {name:<10} (not installed)"); continue
+        wired = _is_wired(t)
+        if wired:
+            print(f"  {C.G}✓{C.R} {name:<10} wired → {t['config']}")
+        else:
+            print(f"  {C.D}·{C.R} {name:<10} installed but not wired ({C.B}./infer wire {name}{C.R})")
+    return 0
+
+
+# --- wire / unwire / detect (same scheme as fi-gateway) -------------------
+
+INFER_OPENAI_URL = f"{BASE_URL}/v1"
+INFER_ANTHROPIC_URL = BASE_URL
+INFER_PROVIDER_ID = "infer"
+FI_WIRE_MODELS_FALLBACK = (
+    "gemini-2.5-flash", "gemini-2.5-flash-lite",
+    "meta/llama-3.3-70b-instruct", "deepseek-ai/deepseek-v3.2",
+    "openrouter/free",
+)
+
+def _wire_model_list() -> list[str]:
+    cache = load_probe_cache(ignore_ttl=True) or {}
+    working = sorted(a for a, r in cache.items() if r.get("ok"))
+    return working if working else list(FI_WIRE_MODELS_FALLBACK)
+
+def _client_master_key() -> str:
+    """The key we tell wired clients to send. The gateway accepts anything
+    on localhost, so this is mostly cosmetic — but tools require the field
+    to be non-empty."""
+    return "infer-localhost"
+
+
+def _wire_pi_check(cfg: dict) -> bool:
+    return INFER_PROVIDER_ID in (cfg.get("providers") or {})
+
+def _wire_pi_patch(cfg: dict, master: str) -> dict:
+    providers = cfg.setdefault("providers", {})
+    providers[INFER_PROVIDER_ID] = {
+        "baseUrl": INFER_OPENAI_URL,
+        "api": "openai-completions",
+        "apiKey": master,
+        "models": [
+            {"id": mid, "name": f"infer/{mid}",
+             "reasoning": "r1" in mid or "reasoning" in mid,
+             "input": ["text", "image"] if any(t in mid.lower() for t in ("gemini", "vision", "-vl-")) else ["text"],
+             "contextWindow": 128000, "maxTokens": 4096,
+             "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}}
+            for mid in _wire_model_list()
+        ],
+    }
+    return cfg
+
+def _wire_pi_unpatch(cfg: dict) -> dict:
+    (cfg.get("providers") or {}).pop(INFER_PROVIDER_ID, None)
+    return cfg
+
+
+_OPENCODE_AUTH = Path.home() / ".local" / "share" / "opencode" / "auth.json"
+
+def _opencode_auth_set(master: str) -> None:
+    _OPENCODE_AUTH.parent.mkdir(parents=True, exist_ok=True)
+    auth: dict = {}
+    if _OPENCODE_AUTH.exists():
+        try: auth = json.loads(_OPENCODE_AUTH.read_text())
+        except json.JSONDecodeError: auth = {}
+    auth[INFER_PROVIDER_ID] = {"type": "api", "key": master}
+    _OPENCODE_AUTH.write_text(json.dumps(auth, indent=2) + "\n")
+
+def _opencode_auth_clear() -> None:
+    if not _OPENCODE_AUTH.exists(): return
+    try: auth = json.loads(_OPENCODE_AUTH.read_text())
+    except json.JSONDecodeError: return
+    if INFER_PROVIDER_ID not in auth: return
+    del auth[INFER_PROVIDER_ID]
+    _OPENCODE_AUTH.write_text(json.dumps(auth, indent=2) + "\n")
+
+def _wire_opencode_check(cfg: dict) -> bool:
+    return INFER_PROVIDER_ID in (cfg.get("provider") or {})
+
+def _wire_opencode_patch(cfg: dict, master: str) -> dict:
+    cfg.setdefault("$schema", "https://opencode.ai/config.json")
+    providers = cfg.setdefault("provider", {})
+    providers[INFER_PROVIDER_ID] = {
+        "npm": "@ai-sdk/openai-compatible",
+        "name": "infer gateway",
+        "options": {"baseURL": INFER_OPENAI_URL, "apiKey": master},
+        "models": {mid: {"name": f"infer/{mid}"} for mid in _wire_model_list()},
+    }
+    _opencode_auth_set(master)
+    return cfg
+
+def _wire_opencode_unpatch(cfg: dict) -> dict:
+    (cfg.get("provider") or {}).pop(INFER_PROVIDER_ID, None)
+    _opencode_auth_clear()
+    return cfg
+
+
+def _wire_cc_check(cfg: dict) -> bool:
+    return (cfg.get("env") or {}).get("ANTHROPIC_BASE_URL") == INFER_ANTHROPIC_URL
+
+def _wire_cc_patch(cfg: dict, master: str) -> dict:
+    env = cfg.setdefault("env", {})
+    env["ANTHROPIC_BASE_URL"] = INFER_ANTHROPIC_URL
+    env["ANTHROPIC_API_KEY"] = master
+    return cfg
+
+def _wire_cc_unpatch(cfg: dict) -> dict:
+    env = cfg.get("env") or {}
+    if env.get("ANTHROPIC_BASE_URL") == INFER_ANTHROPIC_URL:
+        env.pop("ANTHROPIC_BASE_URL", None)
+        env.pop("ANTHROPIC_API_KEY", None)
+    return cfg
+
+
+def _wire_openclaw_check_text(cfg_text: str) -> bool:
+    return BASE_URL in cfg_text and INFER_PROVIDER_ID in cfg_text
+
+def _wire_openclaw_run(master: str) -> int:
+    return subprocess.run([
+        "openclaw", "onboard",
+        "--auth-choice", "custom-api-key",
+        "--custom-provider-id", INFER_PROVIDER_ID,
+        "--custom-base-url", INFER_OPENAI_URL,
+        "--custom-api-key", master,
+        "--custom-model-id", _wire_model_list()[0],
+        "--custom-compatibility", "openai",
+    ]).returncode
+
+
+def _wire_hermes_check_text(cfg_text: str) -> bool:
+    return BASE_URL in cfg_text and "provider: custom" in cfg_text
+
+def _wire_hermes_run(master: str) -> int:
+    pairs = [
+        ("model.provider", "custom"),
+        ("model.base_url", INFER_OPENAI_URL),
+        ("model.api_key", master),
+        ("model.default", _wire_model_list()[0]),
+    ]
+    for k, v in pairs:
+        rc = subprocess.run(["hermes", "config", "set", k, v]).returncode
+        if rc != 0: return rc
+    return 0
+
+
+def _wire_targets() -> dict:
+    return {
+        "pi": {"binary": "pi", "config": Path.home() / ".pi/agent/models.json",
+               "kind": "json", "check": _wire_pi_check, "patch": _wire_pi_patch, "unpatch": _wire_pi_unpatch},
+        "opencode": {"binary": "opencode", "config": Path.home() / ".config/opencode/opencode.json",
+                     "kind": "json", "check": _wire_opencode_check, "patch": _wire_opencode_patch, "unpatch": _wire_opencode_unpatch},
+        "cc": {"binary": "claude", "config": Path.home() / ".claude/settings.json",
+               "kind": "json", "check": _wire_cc_check, "patch": _wire_cc_patch, "unpatch": _wire_cc_unpatch},
+        "openclaw": {"binary": "openclaw", "config": Path.home() / ".openclaw/config.yaml",
+                     "kind": "cli", "check_text": _wire_openclaw_check_text, "wire_run": _wire_openclaw_run},
+        "hermes": {"binary": "hermes", "config": Path.home() / ".hermes/config.yaml",
+                   "kind": "cli", "check_text": _wire_hermes_check_text, "wire_run": _wire_hermes_run},
+    }
+
+def _is_wired(t: dict) -> bool:
+    cfg_path = t["config"]
+    if t.get("kind") == "cli":
+        return t["check_text"](cfg_path.read_text() if cfg_path.exists() else "")
+    cfg = _load_json(cfg_path) if cfg_path.exists() else {}
+    return t["check"](cfg)
+
+def _tool_installed(binary: str) -> bool:
+    rc = subprocess.run(["bash", "-lc", f"command -v {binary}"], capture_output=True, text=True).returncode
+    return rc == 0
+
+def _load_json(path: Path) -> dict:
+    if not path.exists() or path.stat().st_size == 0: return {}
+    try: return json.loads(path.read_text())
+    except json.JSONDecodeError:
+        err(f"config at {path} is not valid JSON"); raise
+
+def _save_json(path: Path, data: dict, mode: int | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    if mode is not None: path.chmod(mode)
+
+def _backup_path(path: Path) -> Path:
+    return path.with_suffix(path.suffix + ".infer-backup")
+
+def cmd_detect(args) -> int:
+    targets = _wire_targets()
+    print(f"{'Tool':<10} {'Installed':<11} {'Config':<50} Status")
+    print("-" * 90)
+    for name, t in targets.items():
+        if not _tool_installed(t["binary"]):
+            print(f"{name:<10} {C.D}no{C.R:<19} {'—':<50} {C.D}(not installed){C.R}")
+            continue
+        wired = _is_wired(t)
+        status = f"{C.G}wired to infer{C.R}" if wired else f"{C.Y}not wired{C.R}"
+        cfg_disp = str(t["config"])
+        if len(cfg_disp) > 49: cfg_disp = "…" + cfg_disp[-48:]
+        print(f"{name:<10} {C.G}yes{C.R:<19} {cfg_disp:<50} {status}")
+    return 0
+
+def cmd_wire(args) -> int:
+    targets = _wire_targets()
+    t = targets.get(args.tool)
+    if not t:
+        err(f"unknown tool: {args.tool}"); return 1
+    if not _tool_installed(t["binary"]):
+        err(f"{args.tool} is not installed — skipping"); return 1
+    master = _client_master_key()
+    cfg_path = t["config"]
+    if _is_wired(t):
+        out(f"{args.tool} is already wired to infer. Run `./infer unwire {args.tool}` to undo.")
+        return 0
+    if cfg_path.exists():
+        backup = _backup_path(cfg_path)
+        backup.write_text(cfg_path.read_text())
+        ok(f"backed up {cfg_path} → {backup}")
+    if t.get("kind") == "cli":
+        rc = t["wire_run"](master)
+        if rc != 0:
+            err(f"{args.tool} CLI returned exit {rc}"); return rc
+    else:
+        cfg = _load_json(cfg_path) if cfg_path.exists() else {}
+        new_cfg = t["patch"](cfg, master)
+        mode = 0o600 if args.tool == "cc" else None
+        _save_json(cfg_path, new_cfg, mode=mode)
+    ok(f"wired {args.tool} — config at {cfg_path}")
+    out(f"  - base URL: {INFER_OPENAI_URL if args.tool != 'cc' else INFER_ANTHROPIC_URL}")
+    out(f"Start the gateway with `./infer serve` (if not already running).")
+    return 0
+
+def cmd_unwire(args) -> int:
+    targets = _wire_targets()
+    t = targets.get(args.tool)
+    if not t: err(f"unknown tool: {args.tool}"); return 1
+    cfg_path = t["config"]
+    backup = _backup_path(cfg_path)
+    if backup.exists():
+        cfg_path.write_text(backup.read_text())
+        backup.unlink()
+        if args.tool == "opencode": _opencode_auth_clear()
+        ok(f"restored {cfg_path} from backup")
+        return 0
+    if not cfg_path.exists():
+        out(f"no config at {cfg_path}"); return 0
+    if t.get("kind") == "cli":
+        out(f"no backup at {backup}; manually edit {cfg_path}"); return 0
+    cfg = _load_json(cfg_path)
+    if not t["check"](cfg):
+        out(f"{args.tool} not wired"); return 0
+    new_cfg = t["unpatch"](cfg)
+    _save_json(cfg_path, new_cfg)
+    ok(f"removed infer from {cfg_path}")
+    return 0
+
+
+# --- install / uninstall (PATH symlink) -----------------------------------
+
+def _install_dir(arg_dir: str | None) -> Path:
+    return Path(arg_dir).expanduser() if arg_dir else Path.home() / ".local" / "bin"
+
+def _shell_rc() -> tuple[str, str]:
+    shell = os.environ.get("SHELL", "")
+    if "zsh" in shell: return "~/.zshrc", 'export PATH="$PATH:{}"'
+    if "fish" in shell: return "~/.config/fish/config.fish", 'fish_add_path {}'
+    return "~/.bashrc", 'export PATH="$PATH:{}"'
+
+def cmd_install(args) -> int:
+    target_dir = _install_dir(args.dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    src = GATEWAY_DIR / "infer"
+    target = target_dir / args.name
+    already = target.is_symlink() and target.resolve() == src.resolve()
+    if not already:
+        if target.is_symlink() or target.exists():
+            if not args.force:
+                err(f"{target} already exists — pass --force to overwrite"); return 1
+            target.unlink()
+        target.symlink_to(src)
+        ok(f"installed: {target} → {src}")
+    else:
+        ok(f"already installed: {target} → {src}")
+    path_dirs = [Path(p).resolve() for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    if target_dir.resolve() not in path_dirs:
+        rc_file, fmt = _shell_rc()
+        out(f"{C.Y}NOTE: {target_dir} isn't on $PATH.{C.R} Add to {rc_file}:")
+        out(f"  {fmt.format(target_dir)}")
+    else:
+        out(f"You can now run `{args.name}` from anywhere.")
+    return 0
+
+def cmd_uninstall(args) -> int:
+    target = _install_dir(args.dir) / args.name
+    if target.is_symlink():
+        target.unlink()
+        ok(f"removed: {target}"); return 0
+    if target.exists():
+        err(f"{target} exists but isn't a symlink"); return 1
+    out(f"nothing at {target}"); return 0
+
+
+# --- argparse -------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="infer", description="Stdlib-only LLM gateway (no Docker, no LiteLLM)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    ps = sub.add_parser("serve", help="Start the gateway HTTP server (foreground)")
+    ps.add_argument("--bind", default=None, help=f"Bind address (default {BIND_HOST})")
+    ps.add_argument("--port", type=int, default=None, help=f"Port (default {PORT})")
+    ps.set_defaults(fn=cmd_serve)
+
+    sub.add_parser("doctor", help="Health overview").set_defaults(fn=cmd_doctor)
+
+    pk = sub.add_parser("keys", help="Manage API keys")
+    ks = pk.add_subparsers(dest="keys_cmd", required=True)
+    pa = ks.add_parser("add"); pa.add_argument("provider"); pa.add_argument("key")
+    pa.set_defaults(fn=cmd_keys_add)
+    ks.add_parser("list").set_defaults(fn=cmd_keys_list)
+    pr = ks.add_parser("remove"); pr.add_argument("provider"); pr.add_argument("--index", type=int, default=None)
+    pr.set_defaults(fn=cmd_keys_remove)
+
+    sub.add_parser("providers", help="Active vs inactive providers").set_defaults(fn=cmd_providers)
+    sub.add_parser("sync", help="Refresh auto-discovered model lists").set_defaults(fn=cmd_sync)
+    pm = sub.add_parser("models", help="List callable model aliases")
+    pm.add_argument("--group", "-g", default=None)
+    pm.add_argument("--working", "-w", action="store_true")
+    pm.add_argument("--broken", action="store_true")
+    pm.set_defaults(fn=cmd_models)
+
+    pp = sub.add_parser("probe", help="Smoke-test every alias against upstreams")
+    pp.add_argument("--group", "-g", default=None)
+    pp.add_argument("--provider", "-p", default=None)
+    pp.add_argument("--limit", "-n", type=int, default=None)
+    pp.add_argument("--concurrency", "-c", type=int, default=8)
+    pp.add_argument("--timeout", "-t", type=int, default=20)
+    pp.set_defaults(fn=cmd_probe)
+
+    sub.add_parser("detect", help="Scan installed agent CLIs").set_defaults(fn=cmd_detect)
+    pw = sub.add_parser("wire"); pw.add_argument("tool", choices=["pi", "opencode", "cc", "openclaw", "hermes"])
+    pw.set_defaults(fn=cmd_wire)
+    pu = sub.add_parser("unwire"); pu.add_argument("tool", choices=["pi", "opencode", "cc", "openclaw", "hermes"])
+    pu.set_defaults(fn=cmd_unwire)
+
+    pi_install = sub.add_parser("install", help="Symlink into a $PATH directory")
+    pi_install.add_argument("--dir", default=None); pi_install.add_argument("--name", default="infer")
+    pi_install.add_argument("--force", action="store_true")
+    pi_install.set_defaults(fn=cmd_install)
+    pu_install = sub.add_parser("uninstall")
+    pu_install.add_argument("--dir", default=None); pu_install.add_argument("--name", default="infer")
+    pu_install.set_defaults(fn=cmd_uninstall)
+
+    return p
+
+
+if __name__ == "__main__":
+    args = build_parser().parse_args()
+    sys.exit(args.fn(args))
