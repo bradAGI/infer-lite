@@ -215,6 +215,7 @@ def _run_discovery(kind: str, refresh: bool = False) -> list[dict]:
         "openrouter_free": _fetch_openrouter,
         "nvidia_nim": _fetch_nvidia,
         "gemini": _fetch_gemini,
+        "opencode_zen_free": _fetch_opencode_zen,
     }
     h = handlers.get(kind)
     if not h:
@@ -330,6 +331,45 @@ def _fetch_gemini(refresh: bool = False) -> list[dict]:
         if cls == "rerank": groups.append("rerank")
         out_list.append({"alias": mid, "upstream": mid, "groups": groups})
     _save_disc_cache("gemini", out_list)
+    return out_list
+
+
+# OpenCode Zen marks free models with a `-free` suffix on the id; stealth
+# models (currently `big-pickle`) are also given out free during their
+# preview period. We surface only those — paid Claude/GPT/Gemini/etc. ids
+# returned by /v1/models would silently bill the user's Zen credits.
+_OPENCODE_ZEN_STEALTH_FREE = {"big-pickle"}
+
+def _fetch_opencode_zen(refresh: bool = False) -> list[dict]:
+    if not refresh:
+        c = _load_disc_cache("opencode_zen_free")
+        if c is not None: return c
+    keys_for = grouped_keys().get("OPENCODE_ZEN_API_KEY", [])
+    if not keys_for: return []
+    print(f"{C.D}discovering opencode zen free models…{C.R}", file=sys.stderr)
+    try:
+        # opencode.ai 403s the default Python-urllib UA; any non-default works.
+        req = urllib.request.Request(
+            "https://opencode.ai/zen/v1/models",
+            headers={"User-Agent": "infer-lite/0.1"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read())
+    except Exception as e:
+        err(f"opencode zen discovery failed: {e}")
+        return _load_disc_cache("opencode_zen_free", ignore_ttl=True) or []
+    out_list = []
+    for m in data.get("data", []):
+        mid = m.get("id") or ""
+        if not mid: continue
+        if not (mid.endswith("-free") or mid in _OPENCODE_ZEN_STEALTH_FREE): continue
+        cls = _classify_alias(mid)
+        if cls == "drop": continue
+        groups = ["opencode_zen", "free"]
+        if cls == "embed": groups.append("embed")
+        if cls == "rerank": groups.append("rerank")
+        out_list.append({"alias": mid, "upstream": mid, "groups": groups})
+    _save_disc_cache("opencode_zen_free", out_list)
     return out_list
 
 

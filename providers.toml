@@ -25,6 +25,15 @@ key_env = "GEMINI_API_KEY"
 base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
 discovery = "gemini"
 
+[[provider]]
+name = "opencode-zen"
+key_env = "OPENCODE_ZEN_API_KEY"
+base_url = "https://opencode.ai/zen/v1"
+discovery = "opencode_zen_free"
+# Filters opencode.ai/zen/v1/models down to the free tier (ids ending in
+# `-free`, plus the `big-pickle` stealth model). Get a key by running
+# `/connect` in the OpenCode TUI.
+
 # --- static ---------------------------------------------------------------
 
 [[provider]]
