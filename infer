@@ -344,8 +344,8 @@ def _fetch_opencode_zen(refresh: bool = False) -> list[dict]:
     if not refresh:
         c = _load_disc_cache("opencode_zen_free")
         if c is not None: return c
-    keys_for = grouped_keys().get("OPENCODE_ZEN_API_KEY", [])
-    if not keys_for: return []
+    # No key required — the free tier of OpenCode Zen is keyless on both
+    # /v1/models and /v1/chat/completions (cost: 0, is_byok: true).
     print(f"{C.D}discovering opencode zen free models…{C.R}", file=sys.stderr)
     try:
         # opencode.ai 403s the default Python-urllib UA; any non-default works.

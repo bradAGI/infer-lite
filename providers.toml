@@ -30,9 +30,10 @@ name = "opencode-zen"
 key_env = "OPENCODE_ZEN_API_KEY"
 base_url = "https://opencode.ai/zen/v1"
 discovery = "opencode_zen_free"
-# Filters opencode.ai/zen/v1/models down to the free tier (ids ending in
-# `-free`, plus the `big-pickle` stealth model). Get a key by running
-# `/connect` in the OpenCode TUI.
+optional_key = true
+# Free tier is keyless on both /v1/models and /v1/chat/completions. The
+# discovery filter keeps only `-free`-suffixed ids plus `big-pickle`
+# (stealth preview). Add a key only if you want to call paid models too.
 
 # --- static ---------------------------------------------------------------
 
